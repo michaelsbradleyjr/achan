@@ -12,6 +12,7 @@ const
 
 switch("nimcache", cacheSubdir)
 
+--define:useMalloc
 --hint:"XCannotRaiseY:off"
 --panics:on
 --tlsEmulation:off # default on|off varies by platform
