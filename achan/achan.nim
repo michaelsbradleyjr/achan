@@ -3,26 +3,40 @@
 import std/[isolation, lists, sequtils, strutils]
 import pkg/[chronos, threading/channels]
 
+# The meaning of "park/ed/s" in names and comments below is in reference to
+# uncompleted Future instances constructed by recv() and send()
+
+const
+  maxParkedRecv* {.intdefine.}: int = 1024
+  maxParkedSend* {.intdefine.}: int = 1024
+
+  MaxParkedRecv = Positive(maxParkedRecv)
+  MaxParkedSend = Natural(maxParkedSend)
+
 type
   AsyncChannelImpl[T] = object
     buffer: Buffer[T]
     closed: bool
-    futsRecv: DoublyLinkedList[Future[T]]
-    futsSend: DoublyLinkedList[tuple[fut: Future[T]; src: Isolated[T]]]
     name: string
+    parkedRecv: DoublyLinkedList[Future[T]]
+    parkedSend: DoublyLinkedList[tuple[fut: Future[T]; src: Isolated[T]]]
     unreceived: bool
 
   AsyncChannel*[T] = ref AsyncChannelImpl[T]
 
   # Regardless of buffer kind, AsyncChannel instances have limits imposed by
-  # MaxPendingRecv and MaxPendingSend (tunable at compile-time); if those
-  # limits are exceeded at runtime then there is a mismatch between rates of
-  # data production and consumption that must be addressed by this library's
-  # user, e.g. backpressure may need to be better communicated via `await`, and
-  # in any case the app-specific state machines written by the user will need
-  # to be reconsidered, by that user! If the library user chooses kind
-  # 'bkUnbounded' there will inevitably be unacceptable memory consumption, but
+  # maxParkedRecv and maxParkedSend (tunable at compile-time); if those
+  # limits are exceeded at runtime then there is an effective (and probably
+  # unanticipated) mismatch between rates of data production and consumption
+  # that must be addressed by this library's user, e.g. backpressure may need
+  # to be better communicated via `await`, and in any case the app-specific
+  # state machines written by the user (the app's developer) will need to be
+  # reconsidered, by that user! If the library user chooses buffer kind
+  # 'bkUnbounded' then unacceptable memory consumption is a likely outcome, but
   # that *is* a choice the user can make.
+  #
+  # The meaning of "parks" in comments below is that the future returned by
+  # recv() or send() is not completed before it is returned
   BufferKind* = enum
     # `bkUnbuffered` recv() parks if no data has been sent since previous recv()
     #                send() parks if previously sent data is unreceived
@@ -36,7 +50,8 @@ type
     #                send() never parks, buffer growth is unbounded!
     #                suitable for exploration of concepts
     #                *maybe* suitable for prototypes
-    #                **not** suitable for general development and production
+    #                **not** generally suitable for development and production,
+    #                don't be a buffoon
     bkUnbuffered, bkFixed, bkDropping, bkSliding, bkUnbounded
 
   Buffer*[T] = object
@@ -53,16 +68,14 @@ type
 
   ClosedDefect* = object of Defect
 
-  PendingLimitDefect* = object of Defect
+  ParkedLimitDefect* = object of Defect
 
 const
-  maxPendingRecv* {.intdefine.}: int = 1024
-  maxPendingSend* {.intdefine.}: int = 1024
-
-  MaxPendingRecv = Natural(maxPendingRecv)
-  MaxPendingSend = Natural(maxPendingSend)
-
+  # ? get rid of or make func, try out some approaches...
   msgBufferSizeTooSmall = "'bufSize' must be > 0"
+
+template joinLines(s: string): string =
+  s.split("\n").mapIt(it.strip).join(" ")
 
 func msgClosedBeforeRecvAndEmpty(name: string): string =
   try:
@@ -74,7 +87,7 @@ func msgClosedBeforeRecvAndEmpty(name: string): string =
     ("""
      AsyncChannel $# was closed before recv() and the channel holds no
      unreceived data, guard with isClosed() and hasUnreceived()
-     """ % [clause]).split("\n").mapIt(it.strip).join(" ")
+     """ % [clause]).joinLines
   except ValueError as e:
     raise (ref Defect)(msg: e.msg)
 
@@ -87,55 +100,60 @@ func msgClosedBeforeSend(name: string): string =
         "instance '$#'" % [name]
     ("""
      AsyncChannel $# was closed before send(), guard with isClosed()
-     """ % [clause]).split("\n").mapIt(it.strip).join(" ")
+     """ % [clause]).joinLines
   except ValueError as e:
     raise (ref Defect)(msg: e.msg)
 
 func msgBufferSizeNotSupported(kind: BufferKind): string =
-  "'bufSize' required for kind '" & $kind & "'"
+  "'bufSize' not supported for kind '" & $kind & "'"
 
 func msgBufferSizeRequired(kind: BufferKind): string =
   "'bufSize' required for kind '" & $kind & "'"
 
-func msgPendingLimitRecv(name: string): string =
+func msgParkedLimitRecv(name: string): string =
   try:
     let
       clause1 =
-        if MaxPendingRecv == 0:
-          "No"
+        if MaxParkedRecv == 1:
+          "is"
         else:
-          "No more than $#" % [$MaxPendingRecv]
+          "are"
       clause2 =
         if name == "":
           "an AsyncChannel instance"
         else:
           "AsyncChannel instance '$#'" % [name]
     ("""
-     $# pending recv() are allowed on $#, consider using a
-     windowed buffer kind: 'bkDropping', 'bkSliding'; or adjust the limit with
-     compile-time option `-d:maxPendingRecv=N`
-     """ % [clause1, clause2]).split("\n").mapIt(it.strip).join(" ")
+     No more than $# parked recv() $# allowed on $#, consider using a windowed
+     buffer kind: 'bkDropping', 'bkSliding'; or adjust the limit with
+     compile-time option `-d:maxParkedRecv=N`
+     """ % [$MaxParkedRecv, clause1, clause2]).joinLines
   except ValueError as e:
     raise (ref Defect)(msg: e.msg)
 
-func msgPendingLimitSend(name: string): string =
+func msgParkedLimitSend(name: string): string =
   try:
     let
       clause1 =
-        if MaxPendingSend == 0:
+        if MaxParkedSend == 0:
           "No"
         else:
-          "No more than $#" % [$MaxPendingSend]
+          "No more than $#" % [$MaxParkedSend]
       clause2 =
+        if MaxParkedSend == 1:
+          "is"
+        else:
+          "are"
+      clause3 =
         if name == "":
           "an AsyncChannel instance"
         else:
           "AsyncChannel instance '$#'" % [name]
     ("""
-     $# pending send() are allowed on $#, consider using a
-     windowed buffer kind: 'bkDropping', 'bkSliding'; or adjust the limit with
-     compile-time option `-d:maxPendingSend=N`
-     """ % [clause1, clause2]).split("\n").mapIt(it.strip).join(" ")
+     $# parked send() $# allowed on $#, consider using a windowed buffer kind:
+     'bkDropping', 'bkSliding'; or adjust the limit with compile-time option
+     `-d:maxParkedSend=N`
+     """ % [clause1, clause2, clause3]).joinLines
   except ValueError as e:
     raise (ref Defect)(msg: e.msg)
 
@@ -149,20 +167,20 @@ func achan*[T](name: string = ""): AsyncChannel[T] =
 
 func achan*[T](kind: BufferKind; name = ""): AsyncChannel[T] =
   case kind
-  of bkUnbuffered:
-    AsyncChannel[T].new(Buffer[T](kind: kind), name)
-  of bkUnbounded:
+  of bkUnbuffered, bkUnbounded:
     AsyncChannel[T].new(Buffer[T](kind: kind), name)
   of bkFixed, bkDropping, bkSliding:
     raise (ref AssertionDefect)(msg: msgBufferSizeRequired(kind))
 
+# fix this one re: 1 or 2
 func achan*[T](bufSize: int; name: string = ""): AsyncChannel[T] =
   if bufSize < 1:
     raise (ref AssertionDefect)(msg: msgBufferSizeTooSmall)
   AsyncChannel[T].new(Buffer[T](kind: bkFixed, bufSize: bufSize), name)
 
-func achan*[T](
-    kind: BufferKind; bufSize: int; name: string = ""): AsyncChannel[T] =
+# fix this one re: 1 or 2
+func achan*[T](kind: BufferKind; bufSize: int; name: string = ""):
+    AsyncChannel[T] =
   case kind
   of bkFixed, bkDropping, bkSliding:
     if bufSize < 1:
@@ -190,12 +208,12 @@ proc recv*[T](c: AsyncChannel[T]): Future[T] {.async: (raw: true).} =
   case c.buffer.kind
   of bkUnbuffered:
     if c.unreceived:
-      # WIP: need logic such that if futsSend is not empty then process the
+      # WIP: need logic such that if parkedSend is not empty then process the
       # next one, i.e. it's not as simple as the 2 lines I have below presently
       fut.complete(c.buffer.unbufData.extract)
       c.unreceived = false
     else:
-      c.futsRecv.add newDoublyLinkedNode[Future[T]](fut)
+      c.parkedRecv.add newDoublyLinkedNode[Future[T]](fut)
     fut
   # of bkFixed:
   #   # WIP ... state machine re: buffer
@@ -222,7 +240,7 @@ proc send*[T](c: AsyncChannel[T]; src: sink Isolated[T]):
     case c.buffer.kind
     of bkUnbuffered:
       # if c.unreceived:
-      #   # add to futsSend
+      #   # add to parkedSend
       #   ...
       # else:
       #   if ...:
