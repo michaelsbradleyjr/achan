@@ -4,7 +4,7 @@ import std/[isolation, lists, sequtils, strutils]
 import pkg/[chronos, threading/channels]
 
 # The meaning of "park/ed/s" in names and comments below is in reference to
-# uncompleted Future instances constructed by recv() and send()
+# uncompleted futures returned by recv() and send()
 
 const
   maxParkedRecv* {.intdefine.}: int = 1024
@@ -25,8 +25,8 @@ type
   AsyncChannel*[T] = ref AsyncChannelImpl[T]
 
   # Regardless of buffer kind, AsyncChannel instances have limits imposed by
-  # maxParkedRecv and maxParkedSend (tunable at compile-time); if those
-  # limits are exceeded at runtime then there is an effective (and probably
+  # maxParkedRecv and maxParkedSend (tunable at compile-time); if those limits
+  # are exceeded at runtime then there is an effective (and probably
   # unanticipated) mismatch between rates of data production and consumption
   # that must be addressed by this library's user, e.g. backpressure may need
   # to be better communicated via `await`, and in any case the app-specific
@@ -34,10 +34,7 @@ type
   # reconsidered, by that user! If the library user chooses buffer kind
   # 'bkUnbounded' then unacceptable memory consumption is a likely outcome, but
   # that *is* a choice the user can make.
-  #
-  # The meaning of "parks" in comments below is that the future returned by
-  # recv() or send() is not completed before it is returned
-  BufferKind* = enum
+  BufferKinds* = enum
     # `bkUnbuffered` recv() parks if no data has been sent since previous recv()
     #                send() parks if previously sent data is unreceived
     # `bkFixed`      recv() parks if buffer is empty
@@ -50,32 +47,41 @@ type
     #                send() never parks, buffer growth is unbounded!
     #                suitable for exploration of concepts
     #                *maybe* suitable for prototypes
-    #                **not** generally suitable for development and production,
+    #                **not** generally suitable for development or production,
     #                don't be a buffoon
     bkUnbuffered, bkFixed, bkDropping, bkSliding, bkUnbounded
 
-  Buffer*[T] = object
-    case kind: BufferKind
+  Buffer[T] = object
+    case kind: BufferKinds
     of bkUnbuffered:
       unbufData: Isolated[T]
-    of bkFixed, bkDropping, bkSliding:
-      bufCount: int
-      bufData: DoublyLinkedList[Isolated[T]]
-      bufSize: int
+    of bkFixed:
+      buffiData: DoublyLinkedList[Isolated[T]]
+      buffiSize: TwoPlus
+    of bkDropping, bkSliding: # *wi*ndowed kinds
+      bufwiData: DoublyLinkedList[Isolated[T]]
+      bufwiSize: Positive
     of bkUnbounded:
-      bufunCount: int
       bufunData: DoublyLinkedList[Isolated[T]]
 
-  ClosedDefect* = object of Defect
+  ClosedDefect = object of Defect
 
-  ParkedLimitDefect* = object of Defect
+  ParkedLimitDefect = object of Defect
 
-const
-  # ? get rid of or make func, try out some approaches...
-  msgBufferSizeTooSmall = "'bufSize' must be > 0"
+  TwoPlus = range[2..high(int)]
 
 template joinLines(s: string): string =
   s.split("\n").mapIt(it.strip).join(" ")
+
+func msgBufSizeTooSmall(kind: BufferKinds; min: Positive): string =
+  let
+    clause1 = "'bufSize' for kind '" & $kind & "' must be >= " & $min
+    clause2 =
+      if kind == bkFixed:
+        ", else use '" & $bkUnbuffered & "'"
+      else:
+        ""
+  clause1 & clause2
 
 func msgClosedBeforeRecvAndEmpty(name: string): string =
   try:
@@ -104,10 +110,10 @@ func msgClosedBeforeSend(name: string): string =
   except ValueError as e:
     raise (ref Defect)(msg: e.msg)
 
-func msgBufferSizeNotSupported(kind: BufferKind): string =
+func msgBufSizeNotSupported(kind: BufferKinds): string =
   "'bufSize' not supported for kind '" & $kind & "'"
 
-func msgBufferSizeRequired(kind: BufferKind): string =
+func msgBufSizeRequired(kind: BufferKinds): string =
   "'bufSize' required for kind '" & $kind & "'"
 
 func msgParkedLimitRecv(name: string): string =
@@ -157,37 +163,62 @@ func msgParkedLimitSend(name: string): string =
   except ValueError as e:
     raise (ref Defect)(msg: e.msg)
 
-func new*[T](
-    U: typedesc[AsyncChannel[T]]; buffer: sink Buffer[T];
-    name: string = ""): U =
+func new[T](
+    U: typedesc[AsyncChannel[T]]; buffer: sink Buffer[T]; name: string): U =
   U(buffer: buffer, name: name)
 
 func achan*[T](name: string = ""): AsyncChannel[T] =
   AsyncChannel[T].new(Buffer[T](kind: bkUnbuffered), name)
 
-func achan*[T](kind: BufferKind; name = ""): AsyncChannel[T] =
+func achan*[T](kind: BufferKinds; name = ""): AsyncChannel[T] =
   case kind
-  of bkUnbuffered, bkUnbounded:
-    AsyncChannel[T].new(Buffer[T](kind: kind), name)
+  of bkUnbuffered:
+    AsyncChannel[T].new(Buffer[T](kind: bkUnbuffered), name)
+  of bkUnbounded:
+    AsyncChannel[T].new(Buffer[T](kind: bkUnbounded), name)
   of bkFixed, bkDropping, bkSliding:
-    raise (ref AssertionDefect)(msg: msgBufferSizeRequired(kind))
+    raise (ref AssertionDefect)(msg: msgBufSizeRequired(kind))
 
-# fix this one re: 1 or 2
 func achan*[T](bufSize: int; name: string = ""): AsyncChannel[T] =
-  if bufSize < 1:
-    raise (ref AssertionDefect)(msg: msgBufferSizeTooSmall)
-  AsyncChannel[T].new(Buffer[T](kind: bkFixed, bufSize: bufSize), name)
+  const minSize = low(Buffer[int].buffiSize)
+  if bufSize < minSize:
+    raise (ref AssertionDefect)(msg: msgBufSizeTooSmall(bkFixed, minSize))
+  AsyncChannel[T].new(Buffer[T](kind: bkFixed, buffiSize: bufSize), name)
 
-# fix this one re: 1 or 2
-func achan*[T](kind: BufferKind; bufSize: int; name: string = ""):
+func achan*[T](kind: BufferKinds; bufSize: int; name: string = ""):
     AsyncChannel[T] =
   case kind
-  of bkFixed, bkDropping, bkSliding:
-    if bufSize < 1:
-      raise (ref AssertionDefect)(msg: msgBufferSizeTooSmall)
-    AsyncChannel[T].new(Buffer[T](kind: kind, bufSize: bufSize), name)
+  of bkFixed:
+    const minSize = low(Buffer[int].buffiSize)
+    if bufSize < minSize:
+      raise (ref AssertionDefect)(msg: msgBufSizeTooSmall(bkFixed, minSize))
+    AsyncChannel[T].new(Buffer[T](kind: bkFixed, buffiSize: bufSize), name)
+  of bkDropping:
+    const minSize = low(Buffer[int].bufwiSize)
+    if bufSize < minSize:
+      raise (ref AssertionDefect)(msg: msgBufSizeTooSmall(bkDropping, minSize))
+    AsyncChannel[T].new(Buffer[T](kind: bkDropping, bufwiSize: bufSize), name)
+  of bkSliding:
+    const minSize = low(Buffer[int].bufwiSize)
+    if bufSize < minSize:
+      raise (ref AssertionDefect)(msg: msgBufSizeTooSmall(bkSliding, minSize))
+    AsyncChannel[T].new(Buffer[T](kind: bkSliding, bufwiSize: bufSize), name)
   else:
-    raise (ref AssertionDefect)(msg: msgBufferSizeNotSupported(kind))
+    raise (ref AssertionDefect)(msg: msgBufSizeNotSupported(kind))
+
+func bufKind*(c: AsyncChannel): BufferKinds =
+  c.buffer.kind
+
+func bufSize*(c: AsyncChannel): int =
+  let kind = c.buffer.kind
+  case kind
+  of bkFixed:
+    c.buffer.buffiSize.int
+  of bkDropping, bkSliding:
+    c.buffer.bufwiSize.int
+  else:
+    raise (ref Defect)(msg:
+      "bufSize() not supported for kind '" & $kind & "', guard with bufKind()")
 
 proc close*(c: AsyncChannel) =
   c.closed = true

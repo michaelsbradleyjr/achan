@@ -5,7 +5,6 @@ import pkg/[achan, chronos]
 proc amain() {.async.} =
   let chan = achan[int]()
 
-  # discard await chan.send(123).withTimeout(1.seconds)
   await chan.send(123)
 
   let data = await chan.recv
@@ -23,3 +22,11 @@ proc main() =
 
 when isMainModule:
   main()
+
+
+# NOTES: while working on achan & examples/tests
+# ------------------------------------------------------------------------------
+# can append e.g. `.withTimeout(1.seconds)` to a future that otherwise seems
+# stuck while working out the details of why that's happening (bug in achan
+# library? app's state machine/s need revision?), but in that case will need to
+# e.g. `discard await ...`
