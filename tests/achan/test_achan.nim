@@ -1,5 +1,4 @@
-# import pkg/achan
-import pkg/unittest2
+import pkg/[achan, asynctest/chronos/unittest]
 
 suite "achan":
   test "write some tests":
