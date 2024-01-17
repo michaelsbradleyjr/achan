@@ -12,6 +12,7 @@ const
 
 switch("nimcache", cacheSubdir)
 
+--define:useMalloc
 --hint:"XCannotRaiseY:off"
 --panics:on
 --tlsEmulation:off # default on|off varies by platform
@@ -19,16 +20,17 @@ switch("nimcache", cacheSubdir)
 
 when defined(release):
   --hints:off
-  --passC:"-flto=auto"
-  --passL:"-flto=auto"
-  --passL:"-s"
+  if not defined(coverage):
+    --passC:"-flto=auto"
+    --passL:"-flto=auto"
+    --passL:"-s"
 else:
   --debugger:native
   --define:debug
   --linetrace:on
   --stacktrace:on
 when defined(coverage):
-  when defined(release):
+  if defined(release):
     --debugger:native
   --passC:"--coverage"
   --passL:"--coverage"

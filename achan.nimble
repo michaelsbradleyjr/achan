@@ -7,6 +7,6 @@ installDirs  = @["achan"]
 installFiles = @["LICENSE", "LICENSE-APACHEv2", "LICENSE-MIT", "achan.nim"]
 
 requires "nim >= 2.0.0",
-         "chronos",
-         "results",
-         "unittest2"
+         "asynctest#head",
+         "chronos#head",
+         "threading#head"
